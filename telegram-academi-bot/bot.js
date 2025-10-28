@@ -30,6 +30,43 @@ if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR);
 }
 
+// Wait until a stable, final downloaded file (not .crdownload) appears
+async function waitForStableDownloadedFile(tempDir, filesBefore, timeoutMs = 120000) {
+    const start = Date.now();
+    let lastSize = -1;
+    let stableCount = 0;
+    while (Date.now() - start < timeoutMs) {
+        const files = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
+        const candidates = files
+            .filter(f => !filesBefore.includes(f))
+            .filter(f => !f.endsWith('.crdownload'))
+            // do not filter by extension to support blob-based names; verify later by signature
+            .map(f => {
+                const p = path.join(tempDir, f);
+                let st; try { st = fs.statSync(p); } catch { return null; }
+                return st ? { f, p, st } : null;
+            })
+            .filter(Boolean);
+        if (candidates.length > 0) {
+            // pick most recent
+            candidates.sort((a,b) => b.st.mtimeMs - a.st.mtimeMs);
+            const top = candidates[0];
+            const size = top.st.size;
+            if (size === lastSize) {
+                stableCount++;
+            } else {
+                stableCount = 0;
+                lastSize = size;
+            }
+            if (stableCount >= 2 && size > 0) { // stable for ~2s
+                return top.f;
+            }
+        }
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    return null;
+}
+
 // Basic validation for downloaded reports: ensure expected file type signature and non-trivial size
 function isValidDownloaded(filePath) {
     try {
@@ -728,27 +765,20 @@ async function uploadToAcademiCx(filePath, fileName, tempDir, jobToken) {
                     return processedFilePath;
                 }
 
-                // 2) Если не получилось, ловим сетевой ответ
+                // 2) Если не получилось, ловим сетевой ответ (увеличили таймаут)
                 const resp = await page.waitForResponse(r => {
                     const url = r.url();
                     return r.ok() && (url.includes('download') || url.endsWith('.pdf') || url.includes('.pdf'));
-                }, { timeout: 60000 }).catch(() => null);
+                }, { timeout: 120000 }).catch(() => null);
                 if (resp) {
                     const url = resp.url();
-                    try {
-                        const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
-                        await downloadFile(url, processedFilePath);
-                        console.log('File downloaded via captured network response!');
-                        if (!isValidDownloaded(processedFilePath)) {
-                            throw new Error('Downloaded report is invalid or empty (import failure).');
-                        }
-                        return processedFilePath;
-                    } catch (e) {
-                        console.log('Network-response download failed, will fallback to file watcher/link scan:', e.message);
+                    const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
+                    await downloadFile(url, processedFilePath);
+                    console.log('File downloaded via captured network response!');
+                    if (!isValidDownloaded(processedFilePath)) {
+                        throw new Error('Downloaded report is invalid or empty (import failure).');
                     }
-                } else {
-                    // короткая задержка перед файлом-стражем
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    return processedFilePath;
                 }
             }
         } else {
@@ -756,91 +786,13 @@ async function uploadToAcademiCx(filePath, fileName, tempDir, jobToken) {
             throw new Error('Download AI report button not found');
         }
 
-        // Ждем появления нового файла
-        console.log('Waiting for new file to appear...');
-        let attempts = 0;
-        let newFile = null;
-        
-        while (attempts < 60 && !newFile) { // до 60 секунд ожидания
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            const filesAfter = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
-            const newFiles = filesAfter.filter(f => !filesBefore.includes(f) && !f.startsWith(path.basename(filePath)));
-            
-            if (newFiles.length > 0) {
-                newFile = newFiles[0];
-                console.log('New file detected:', newFile);
-                break;
-            }
-            
-            attempts++;
-            if (attempts % 5 === 0) {
-                console.log(`Still waiting... (${attempts} seconds)`);
-            }
-        }
-
-        if (newFile) {
-            const downloadedFile = path.join(tempDir, newFile);
-
-            // Используем оригинальное имя скачанного файла (с правильным расширением)
-            const downloadedExt = path.extname(newFile); // .pdf
-            const originalBaseName = path.basename(fileName, path.extname(fileName)); // без расширения
-            const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${originalBaseName}${downloadedExt}`);
-
-            // Дожидаемся полной записи файла и выполняем переименование с повторами
-            let attemptsRename = 0;
-            while (attemptsRename < 10) { // до ~10 секунд ожидания
-                try {
-                    // Проверяем, что файл существует и не пустой
-                    if (fs.existsSync(downloadedFile)) {
-                        const st = fs.statSync(downloadedFile);
-                        if (st.size > 0) {
-                            fs.renameSync(downloadedFile, processedFilePath);
-                            console.log('File processed successfully!');
-                            console.log('Final file:', path.basename(processedFilePath));
-                            if (!isValidDownloaded(processedFilePath)) {
-                                throw new Error('Downloaded report is invalid or empty (import failure).');
-                            }
-                            return processedFilePath;
-                        }
-                    }
-                } catch (e) {
-                    // Если файл ещё не готов — подождём и попробуем снова
-                    console.log('Rename not ready, retrying...', e.message);
-                }
-                await new Promise(r => setTimeout(r, 1000));
-                attemptsRename++;
-            }
-
-            throw new Error('Downloaded file not ready for rename after retries');
-        } else {
-            // Последний fallback: попробуем найти ссылку для скачивания на странице
-            console.log('No file detected by watcher. Scanning page for download links...');
-            const candidateLinks = await page.$$eval('a[href]', as => as.map(a => a.href).filter(h => h && (h.includes('download') || h.endsWith('.pdf') || h.includes('.pdf'))));
-            if (candidateLinks && candidateLinks.length) {
-                const url = candidateLinks[0];
-                const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
-                try {
-                    await downloadFile(url, processedFilePath);
-                    console.log('File downloaded via page link scan fallback!');
-                    if (!isValidDownloaded(processedFilePath)) {
-                        throw new Error('Downloaded report is invalid or empty (import failure).');
-                    }
-                    return processedFilePath;
-                } catch (e) {
-                    console.log('Link scan fallback failed:', e.message);
-                }
-            }
-
-            console.log('No new file found after extended wait');
-            throw new Error('Could not find downloaded file - timeout after 60 seconds');
-        }
+        // Если мы дошли сюда — не получили прямую ссылку ни через строку с токеном, ни сетевым перехватом
+        console.log('Could not obtain direct download URL (row or network)');
+        throw new Error('Could not obtain direct download URL for the report (timeout)');
 
     } finally {
         await browser.close();
     }
-}
-
 // Handle callback queries (кнопки покупки)
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
