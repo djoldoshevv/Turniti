@@ -8,6 +8,9 @@ primary_region = 'arn'
 
 [build]
 
+[env]
+  MAX_CONCURRENCY = "3"
+
 [http_service]
   internal_port = 3000
   force_https = true
