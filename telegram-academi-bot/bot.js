@@ -39,6 +39,38 @@ console.log('Bot started successfully!');
 const queueByUser = new Map(); // chatId -> [jobs]
 const processingByUser = new Map(); // chatId -> boolean
 
+// Global concurrency limiter
+const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '2', 10);
+let activeJobs = 0;
+
+function schedule() {
+    if (activeJobs >= MAX_CONCURRENCY) return;
+    for (const [uid, q] of queueByUser.entries()) {
+        if (activeJobs >= MAX_CONCURRENCY) break;
+        if (q.length === 0) continue;
+        if (processingByUser.get(uid)) continue;
+        startNextForUser(uid);
+    }
+}
+
+function startNextForUser(chatId) {
+    if (activeJobs >= MAX_CONCURRENCY) return;
+    if (processingByUser.get(chatId)) return;
+    const q = queueByUser.get(chatId) || [];
+    if (q.length === 0) return;
+    const job = q.shift();
+    queueByUser.set(chatId, q);
+    processingByUser.set(chatId, true);
+    activeJobs++;
+    handleDocumentJob(job)
+        .catch(e => console.error('Error in job:', e))
+        .finally(() => {
+            processingByUser.set(chatId, false);
+            activeJobs--;
+            schedule();
+        });
+}
+
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
@@ -162,32 +194,16 @@ bot.on('document', async (msg) => {
     queue.push({ chatId, fileId, fileName, fileSize: document.file_size, from: msg.from });
     queueByUser.set(chatId, queue);
 
-    if (!processingByUser.get(chatId)) {
-        processNextJob(chatId).catch((e) => console.error('Queue processing error:', e));
+    // If cannot start immediately, inform about queue position
+    if (processingByUser.get(chatId) || activeJobs >= MAX_CONCURRENCY) {
+        try {
+            await bot.sendMessage(chatId, `🕒 Высокая нагрузка. Ваша задача поставлена в очередь. Позиция: ${queue.length}.`);
+        } catch (_) {}
     }
+
+    // Try to schedule
+    schedule();
 });
-
-async function processNextJob(chatId) {
-    const queue = queueByUser.get(chatId) || [];
-    if (queue.length === 0) {
-        processingByUser.set(chatId, false);
-        return;
-    }
-    if (processingByUser.get(chatId)) return;
-    processingByUser.set(chatId, true);
-
-    const job = queue.shift();
-    queueByUser.set(chatId, queue);
-    try {
-        await handleDocumentJob(job);
-    } catch (e) {
-        console.error('Error in job:', e);
-    } finally {
-        processingByUser.set(chatId, false);
-        // proceed to next
-        processNextJob(chatId).catch(() => {});
-    }
-}
 
 async function handleDocumentJob(job) {
     const { chatId, fileId, fileName, fileSize, from } = job;
