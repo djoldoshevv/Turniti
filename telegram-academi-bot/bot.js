@@ -71,6 +71,23 @@ function startNextForUser(chatId) {
         });
 }
 
+// Sanitize and transliterate filename to ASCII (academi.cx doesn't accept Cyrillic)
+function sanitizeFileName(name) {
+    const map = {
+        'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+        'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'Zh','З':'Z','И':'I','Й':'Y','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya'
+    };
+    const ext = (path.extname(name) || '').toLowerCase();
+    let base = path.basename(name, ext);
+    base = base.split('').map(ch => map[ch] ?? ch).join('');
+    base = base.replace(/\s+/g, '_');
+    base = base.replace(/[^A-Za-z0-9._-]/g, '_');
+    base = base.replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+    if (!base) base = 'file';
+    if (base.length > 80) base = base.slice(0,80);
+    return base + ext;
+}
+
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
@@ -252,13 +269,24 @@ async function handleDocumentJob(job) {
         const filePath = path.join(jobDir, `${Date.now()}_${fileName}`);
         await downloadFile(fileLink, filePath);
 
+        // Rename to sanitized ASCII filename for academi.cx upload
+        const sanitizedName = sanitizeFileName(fileName);
+        const sanitizedPath = path.join(jobDir, sanitizedName);
+        try { fs.renameSync(filePath, sanitizedPath); } catch (_) { /* fallback to copy if needed */ }
+        if (!fs.existsSync(sanitizedPath)) {
+            try {
+                fs.copyFileSync(filePath, sanitizedPath);
+                fs.unlinkSync(filePath);
+            } catch (_) {}
+        }
+
         await bot.editMessageText('📤 Отправляю на обработку...', {
             chat_id: chatId,
             message_id: processingMsg.message_id
         });
 
-        // Upload and get processed file
-        const processedFilePath = await uploadToAcademiCx(filePath, fileName, jobDir);
+        // Upload and get processed file using sanitized name
+        const processedFilePath = await uploadToAcademiCx(sanitizedPath, sanitizedName, jobDir);
 
         // Использовать одну проверку (списываем только при успешной обработке)
         userDB.useCheck(chatId);
@@ -601,6 +629,13 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
         const filesBefore = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
         console.log('Files before download:', filesBefore.length);
 
+        // Вспомогательная нормализация для поиска по имени файла
+        function normalizeName(s) {
+            return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        }
+        const baseNameNoExt = path.basename(fileName, path.extname(fileName));
+        const baseNameNorm = normalizeName(baseNameNoExt);
+
         if (downloadButtonClicked.clicked) {
             console.log('Download AI report button clicked!');
             console.log('Button text:', downloadButtonClicked.text);
@@ -616,8 +651,52 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                 console.log('File downloaded successfully via direct link!');
                 return processedFilePath;
             } else {
-                console.log('Button clicked (JavaScript download), waiting for file...');
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log('Button clicked (JavaScript download), trying to select link for the just-uploaded file...');
+
+                // 1) Попробуем найти ссылку скачивания в строке, где есть имя загруженного файла
+                const rowLink = await page.evaluate((nameNorm) => {
+                    function norm(s){ return (s||'').toLowerCase().replace(/\s+/g,' ').trim(); }
+                    const rows = Array.from(document.querySelectorAll('tr, .row, li, .file-item'));
+                    for (const row of rows) {
+                        const txt = norm(row.textContent || '');
+                        if (!txt) continue;
+                        if (txt.includes(nameNorm)) {
+                            // Ищем внутри строки ссылку на скачивание
+                            const a = row.querySelector('a[href*="download"], a[href$=".pdf"], a[href*=".pdf"], a[href*="download_file"]');
+                            if (a && a.href) {
+                                return a.href;
+                            }
+                        }
+                    }
+                    return null;
+                }, baseNameNorm);
+
+                if (rowLink) {
+                    const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
+                    await downloadFile(rowLink, processedFilePath);
+                    console.log('File downloaded using row match by filename!');
+                    return processedFilePath;
+                }
+
+                // 2) Если не получилось, ловим сетевой ответ
+                const resp = await page.waitForResponse(r => {
+                    const url = r.url();
+                    return r.ok() && (url.includes('download') || url.endsWith('.pdf') || url.includes('.pdf'));
+                }, { timeout: 60000 }).catch(() => null);
+                if (resp) {
+                    const url = resp.url();
+                    try {
+                        const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
+                        await downloadFile(url, processedFilePath);
+                        console.log('File downloaded via captured network response!');
+                        return processedFilePath;
+                    } catch (e) {
+                        console.log('Network-response download failed, will fallback to file watcher/link scan:', e.message);
+                    }
+                } else {
+                    // короткая задержка перед файлом-стражем
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
             }
         } else {
             console.log('Download AI report button not found!');
