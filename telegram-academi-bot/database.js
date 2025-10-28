@@ -74,7 +74,7 @@ const userDB = {
 
     // Обновить последнюю активность
     updateLastActive(userId) {
-        const stmt = db.prepare('UPDATE users SET last_active = strftime("%s", "now") WHERE user_id = ?');
+        const stmt = db.prepare("UPDATE users SET last_active = strftime('%s', 'now') WHERE user_id = ?");
         stmt.run(userId);
     },
 
@@ -140,8 +140,8 @@ const userDB = {
     // Получить статистику
     getStats() {
         const total = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
-        const active = db.prepare('SELECT COUNT(*) as count FROM users WHERE subscription_type != "free"').get().count;
-        const today = db.prepare('SELECT COUNT(*) as count FROM users WHERE created_at > strftime("%s", "now", "-1 day")').get().count;
+        const active = db.prepare("SELECT COUNT(*) as count FROM users WHERE subscription_type != 'free'").get().count;
+        const today = db.prepare("SELECT COUNT(*) as count FROM users WHERE created_at > strftime('%s', 'now', '-1 day')").get().count;
         const totalChecks = db.prepare('SELECT SUM(total_checks) as sum FROM users').get().sum || 0;
         
         return { total, active, today, totalChecks };
