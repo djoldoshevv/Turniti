@@ -560,7 +560,7 @@ async function createDefaultAdmin() {
 function startAdminPanel() {
     createDefaultAdmin();
     
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
         console.log(`\n🌐 Admin panel running at http://localhost:${PORT}/admin/login`);
         console.log(`   Username: admin`);
         console.log(`   Password: admin123\n`);
