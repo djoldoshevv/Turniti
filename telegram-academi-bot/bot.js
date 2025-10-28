@@ -35,6 +35,10 @@ const userSessions = new Map();
 
 console.log('Bot started successfully!');
 
+// Per-user processing queues to avoid cross-sending results
+const queueByUser = new Map(); // chatId -> [jobs]
+const processingByUser = new Map(); // chatId -> boolean
+
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
@@ -153,47 +157,97 @@ bot.on('document', async (msg) => {
     const fileId = document.file_id;
     const fileName = document.file_name;
 
-    try {
-        // Создать или получить пользователя
-        const user = userDB.getOrCreate(chatId, msg.from);
-        userDB.updateLastActive(chatId);
-        
-        // Проверить доступ
-        const access = userDB.canUseBot(chatId);
-        
-        if (!access.allowed) {
-            return bot.sendMessage(chatId,
-                '❌ У вас закончились проверки!\n\n' +
-                '💰 Стоимость одной проверки: 500 сом\n\n' +
-                '📦 Или купите пакет проверок:\n' +
-                '• 5 проверок - 2000 сом (скидка 20%)\n' +
-                '• 10 проверок - 3500 сом (скидка 30%)\n' +
-                '• 20 проверок - 6000 сом (скидка 40%)\n\n' +
-                'Используйте /buy для покупки'
-            );
-        }
-        // Send processing message
-        const processingMsg = await bot.sendMessage(chatId, '⏳ Загружаю файл...');
+    // enqueue job per user
+    const queue = queueByUser.get(chatId) || [];
+    queue.push({ chatId, fileId, fileName, fileSize: document.file_size, from: msg.from });
+    queueByUser.set(chatId, queue);
 
+    if (!processingByUser.get(chatId)) {
+        processNextJob(chatId).catch((e) => console.error('Queue processing error:', e));
+    }
+});
+
+async function processNextJob(chatId) {
+    const queue = queueByUser.get(chatId) || [];
+    if (queue.length === 0) {
+        processingByUser.set(chatId, false);
+        return;
+    }
+    if (processingByUser.get(chatId)) return;
+    processingByUser.set(chatId, true);
+
+    const job = queue.shift();
+    queueByUser.set(chatId, queue);
+    try {
+        await handleDocumentJob(job);
+    } catch (e) {
+        console.error('Error in job:', e);
+    } finally {
+        processingByUser.set(chatId, false);
+        // proceed to next
+        processNextJob(chatId).catch(() => {});
+    }
+}
+
+async function handleDocumentJob(job) {
+    const { chatId, fileId, fileName, fileSize, from } = job;
+    // Создать или получить пользователя
+    const user = userDB.getOrCreate(chatId, from);
+    userDB.updateLastActive(chatId);
+
+    // Проверить доступ
+    const access = userDB.canUseBot(chatId);
+    if (!access.allowed) {
+        await bot.sendMessage(chatId,
+            '❌ У вас закончились проверки!\n\n' +
+            '💰 Стоимость одной проверки: 500 сом\n\n' +
+            '📦 Или купите пакет проверок:\n' +
+            '• 5 проверок - 2000 сом (скидка 20%)\n' +
+            '• 10 проверок - 3500 сом (скидка 30%)\n' +
+            '• 20 проверок - 6000 сом (скидка 40%)\n\n' +
+            'Используйте /buy для покупки'
+        );
+        return;
+    }
+
+    const processingMsg = await bot.sendMessage(chatId, '⏳ Загружаю файл...');
+
+    // Job-specific temp directory
+    const jobDir = path.join(TEMP_DIR, `${chatId}_${Date.now()}`);
+    if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
+
+    const cleanup = () => {
+        try {
+            if (fs.existsSync(jobDir)) {
+                const files = fs.readdirSync(jobDir);
+                files.forEach(f => {
+                    const p = path.join(jobDir, f);
+                    try { fs.unlinkSync(p); } catch (_) {}
+                });
+                try { fs.rmdirSync(jobDir); } catch (_) {}
+            }
+        } catch (_) {}
+    };
+
+    try {
         // Download file from Telegram
         const fileLink = await bot.getFileLink(fileId);
-        const filePath = path.join(TEMP_DIR, `${Date.now()}_${fileName}`);
-        
+        const filePath = path.join(jobDir, `${Date.now()}_${fileName}`);
         await downloadFile(fileLink, filePath);
-        
+
         await bot.editMessageText('📤 Отправляю на обработку...', {
             chat_id: chatId,
             message_id: processingMsg.message_id
         });
 
         // Upload and get processed file
-        const processedFilePath = await uploadToAcademiCx(filePath, fileName);
-        
+        const processedFilePath = await uploadToAcademiCx(filePath, fileName, jobDir);
+
         // Использовать одну проверку
         userDB.useCheck(chatId);
-        
+
         // Записать в историю
-        checksDB.add(chatId, fileName, document.file_size, 'success');
+        checksDB.add(chatId, fileName, fileSize, 'success');
 
         await bot.editMessageText('✅ Файл обработан! Отправляю вам...', {
             chat_id: chatId,
@@ -217,20 +271,17 @@ bot.on('document', async (msg) => {
 
         // Delete processing message
         await bot.deleteMessage(chatId, processingMsg.message_id);
-
-        // Clean up temporary files
-        fs.unlinkSync(filePath);
-        fs.unlinkSync(processedFilePath);
-
     } catch (error) {
         console.error('Error processing file:', error);
-        bot.sendMessage(chatId, 
+        await bot.sendMessage(chatId,
             '❌ Произошла ошибка при обработке файла.\n' +
             `Ошибка: ${error.message}\n\n` +
             'Попробуйте еще раз или обратитесь к администратору.'
         );
+    } finally {
+        cleanup();
     }
-});
+}
 
 // Function to download file from URL
 async function downloadFile(url, filePath) {
@@ -250,7 +301,7 @@ async function downloadFile(url, filePath) {
 }
 
 // Function to upload file and get processed file
-async function uploadToAcademiCx(filePath, fileName) {
+async function uploadToAcademiCx(filePath, fileName, tempDir) {
     console.log('Starting file processing...');
 
     // Launch browser
@@ -504,7 +555,7 @@ async function uploadToAcademiCx(filePath, fileName) {
         const client = await page.target().createCDPSession();
         await client.send('Page.setDownloadBehavior', {
             behavior: 'allow',
-            downloadPath: TEMP_DIR
+            downloadPath: tempDir
         });
 
         // Отслеживание скачанных файлов
@@ -525,7 +576,7 @@ async function uploadToAcademiCx(filePath, fileName) {
         });
 
         // Получаем список файлов ДО нажатия кнопки
-        const filesBefore = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR) : [];
+        const filesBefore = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
         console.log('Files before download:', filesBefore.length);
 
         if (downloadButtonClicked.clicked) {
@@ -538,7 +589,7 @@ async function uploadToAcademiCx(filePath, fileName) {
                  downloadButtonClicked.href.includes('download'))) {
                 console.log('Found direct download link:', downloadButtonClicked.href);
                 // Скачиваем напрямую через axios
-                const processedFilePath = path.join(TEMP_DIR, `processed_${Date.now()}_${fileName}`);
+                const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
                 await downloadFile(downloadButtonClicked.href, processedFilePath);
                 console.log('File downloaded successfully via direct link!');
                 return processedFilePath;
@@ -559,7 +610,7 @@ async function uploadToAcademiCx(filePath, fileName) {
         while (attempts < 20 && !newFile) { // 20 попыток по 1 секунде = 20 секунд
             await new Promise(resolve => setTimeout(resolve, 1000));
             
-            const filesAfter = fs.existsSync(TEMP_DIR) ? fs.readdirSync(TEMP_DIR) : [];
+            const filesAfter = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
             const newFiles = filesAfter.filter(f => !filesBefore.includes(f) && !f.startsWith(path.basename(filePath)));
             
             if (newFiles.length > 0) {
@@ -575,12 +626,12 @@ async function uploadToAcademiCx(filePath, fileName) {
         }
 
         if (newFile) {
-            const downloadedFile = path.join(TEMP_DIR, newFile);
+            const downloadedFile = path.join(tempDir, newFile);
 
             // Используем оригинальное имя скачанного файла (с правильным расширением)
             const downloadedExt = path.extname(newFile); // .pdf
             const originalBaseName = path.basename(fileName, path.extname(fileName)); // без расширения
-            const processedFilePath = path.join(TEMP_DIR, `processed_${Date.now()}_${originalBaseName}${downloadedExt}`);
+            const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${originalBaseName}${downloadedExt}`);
 
             // Дожидаемся полной записи файла и выполняем переименование с повторами
             let attemptsRename = 0;
