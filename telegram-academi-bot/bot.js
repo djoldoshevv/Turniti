@@ -30,6 +30,27 @@ if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR);
 }
 
+// Basic validation for downloaded reports: ensure expected file type signature and non-trivial size
+function isValidDownloaded(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return false;
+        const st = fs.statSync(filePath);
+        if (!st.isFile() || st.size < 4096) return false; // <4KB считаем ошибкой/пустым
+        const fd = fs.openSync(filePath, 'r');
+        const buf = Buffer.alloc(5);
+        fs.readSync(fd, buf, 0, 5, 0);
+        fs.closeSync(fd);
+        const header = buf.toString('utf8');
+        // PDF signature
+        if (header.startsWith('%PDF-')) return true;
+        // DOCX (zip) signature: PK\x03\x04
+        if (buf[0] === 0x50 && buf[1] === 0x4B) return true;
+        return false;
+    } catch (_) {
+        return false;
+    }
+}
+
 // Store user sessions
 const userSessions = new Map();
 
@@ -280,6 +301,14 @@ async function handleDocumentJob(job) {
             } catch (_) {}
         }
 
+        // Add unique job token to filename to ensure strict matching later on the site
+        const jobToken = `JOB-${chatId}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+        const tokenizedName = `${jobToken}__${sanitizedName}`;
+        const tokenizedPath = path.join(jobDir, tokenizedName);
+        try { fs.renameSync(sanitizedPath, tokenizedPath); } catch (_) {
+            try { fs.copyFileSync(sanitizedPath, tokenizedPath); fs.unlinkSync(sanitizedPath); } catch (_) {}
+        }
+
         // Validate supported extensions before sending to academi.cx
         const ext = (path.extname(sanitizedName) || '').toLowerCase();
         const supportedExts = new Set(['.docx', '.pdf']);
@@ -298,8 +327,8 @@ async function handleDocumentJob(job) {
             message_id: processingMsg.message_id
         });
 
-        // Upload and get processed file using sanitized name
-        const processedFilePath = await uploadToAcademiCx(sanitizedPath, sanitizedName, jobDir);
+        // Upload and get processed file using tokenized name (strict row matching)
+        const processedFilePath = await uploadToAcademiCx(tokenizedPath, tokenizedName, jobDir, jobToken);
 
         // Использовать одну проверку (списываем только при успешной обработке)
         userDB.useCheck(chatId);
@@ -366,7 +395,7 @@ async function downloadFile(url, filePath) {
 }
 
 // Function to upload file and get processed file
-async function uploadToAcademiCx(filePath, fileName, tempDir) {
+async function uploadToAcademiCx(filePath, fileName, tempDir, jobToken) {
     console.log('Starting file processing...');
 
     // Launch browser
@@ -644,12 +673,12 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
         const filesBefore = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
         console.log('Files before download:', filesBefore.length);
 
-        // Вспомогательная нормализация для поиска по имени файла
+        // Вспомогательная нормализация
         function normalizeName(s) {
             return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
         }
-        const baseNameNoExt = path.basename(fileName, path.extname(fileName));
-        const baseNameNorm = normalizeName(baseNameNoExt);
+        // Используем jobToken как строгий ключ поиска строки
+        const searchKey = normalizeName(jobToken || path.basename(fileName, path.extname(fileName)));
 
         if (downloadButtonClicked.clicked) {
             console.log('Download AI report button clicked!');
@@ -664,11 +693,14 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                 const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
                 await downloadFile(downloadButtonClicked.href, processedFilePath);
                 console.log('File downloaded successfully via direct link!');
+                if (!isValidDownloaded(processedFilePath)) {
+                    throw new Error('Downloaded report is invalid or empty (import failure).');
+                }
                 return processedFilePath;
             } else {
                 console.log('Button clicked (JavaScript download), trying to select link for the just-uploaded file...');
 
-                // 1) Попробуем найти ссылку скачивания в строке, где есть имя загруженного файла
+                // 1) Попробуем найти ссылку скачивания в строке, где есть уникальный токен
                 const rowLink = await page.evaluate((nameNorm) => {
                     function norm(s){ return (s||'').toLowerCase().replace(/\s+/g,' ').trim(); }
                     const rows = Array.from(document.querySelectorAll('tr, .row, li, .file-item'));
@@ -684,12 +716,15 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                         }
                     }
                     return null;
-                }, baseNameNorm);
+                }, searchKey);
 
                 if (rowLink) {
                     const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
                     await downloadFile(rowLink, processedFilePath);
                     console.log('File downloaded using row match by filename!');
+                    if (!isValidDownloaded(processedFilePath)) {
+                        throw new Error('Downloaded report is invalid or empty (import failure).');
+                    }
                     return processedFilePath;
                 }
 
@@ -704,6 +739,9 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                         const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
                         await downloadFile(url, processedFilePath);
                         console.log('File downloaded via captured network response!');
+                        if (!isValidDownloaded(processedFilePath)) {
+                            throw new Error('Downloaded report is invalid or empty (import failure).');
+                        }
                         return processedFilePath;
                     } catch (e) {
                         console.log('Network-response download failed, will fallback to file watcher/link scan:', e.message);
@@ -760,6 +798,9 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                             fs.renameSync(downloadedFile, processedFilePath);
                             console.log('File processed successfully!');
                             console.log('Final file:', path.basename(processedFilePath));
+                            if (!isValidDownloaded(processedFilePath)) {
+                                throw new Error('Downloaded report is invalid or empty (import failure).');
+                            }
                             return processedFilePath;
                         }
                     }
@@ -782,6 +823,9 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
                 try {
                     await downloadFile(url, processedFilePath);
                     console.log('File downloaded via page link scan fallback!');
+                    if (!isValidDownloaded(processedFilePath)) {
+                        throw new Error('Downloaded report is invalid or empty (import failure).');
+                    }
                     return processedFilePath;
                 } catch (e) {
                     console.log('Link scan fallback failed:', e.message);
