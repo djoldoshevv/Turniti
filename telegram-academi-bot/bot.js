@@ -576,19 +576,35 @@ async function uploadToAcademiCx(filePath, fileName) {
 
         if (newFile) {
             const downloadedFile = path.join(TEMP_DIR, newFile);
-            
+
             // Используем оригинальное имя скачанного файла (с правильным расширением)
             const downloadedExt = path.extname(newFile); // .pdf
             const originalBaseName = path.basename(fileName, path.extname(fileName)); // без расширения
             const processedFilePath = path.join(TEMP_DIR, `processed_${Date.now()}_${originalBaseName}${downloadedExt}`);
-            
-            // Ждем пока файл полностью скачается
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            fs.renameSync(downloadedFile, processedFilePath);
-            console.log('File processed successfully!');
-            console.log('Final file:', path.basename(processedFilePath));
-            return processedFilePath;
+
+            // Дожидаемся полной записи файла и выполняем переименование с повторами
+            let attemptsRename = 0;
+            while (attemptsRename < 10) { // до ~10 секунд ожидания
+                try {
+                    // Проверяем, что файл существует и не пустой
+                    if (fs.existsSync(downloadedFile)) {
+                        const st = fs.statSync(downloadedFile);
+                        if (st.size > 0) {
+                            fs.renameSync(downloadedFile, processedFilePath);
+                            console.log('File processed successfully!');
+                            console.log('Final file:', path.basename(processedFilePath));
+                            return processedFilePath;
+                        }
+                    }
+                } catch (e) {
+                    // Если файл ещё не готов — подождём и попробуем снова
+                    console.log('Rename not ready, retrying...', e.message);
+                }
+                await new Promise(r => setTimeout(r, 1000));
+                attemptsRename++;
+            }
+
+            throw new Error('Downloaded file not ready for rename after retries');
         } else {
             console.log('No new file found after 20 seconds');
             throw new Error('Could not find downloaded file - timeout after 20 seconds');
