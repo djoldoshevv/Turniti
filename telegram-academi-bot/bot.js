@@ -197,6 +197,7 @@ async function handleDocumentJob(job) {
 
     // Проверить доступ
     const access = userDB.canUseBot(chatId);
+    const accessReason = access.reason; // 'subscription' | 'free_checks' | 'no_access'
     if (!access.allowed) {
         await bot.sendMessage(chatId,
             '❌ У вас закончились проверки!\n\n' +
@@ -243,7 +244,7 @@ async function handleDocumentJob(job) {
         // Upload and get processed file
         const processedFilePath = await uploadToAcademiCx(filePath, fileName, jobDir);
 
-        // Использовать одну проверку
+        // Использовать одну проверку (списываем только при успешной обработке)
         userDB.useCheck(chatId);
 
         // Записать в историю
@@ -273,9 +274,14 @@ async function handleDocumentJob(job) {
         await bot.deleteMessage(chatId, processingMsg.message_id);
     } catch (error) {
         console.error('Error processing file:', error);
+        // Записываем неуспешную попытку
+        try { checksDB.add(chatId, fileName, fileSize, 'failed'); } catch (_) {}
+        // Возврат средств/чека: если пользователь в режиме free_checks, добавим 1 чек обратно
+        try { if (accessReason === 'free_checks') userDB.addFreeChecks(chatId, 1); } catch (_) {}
         await bot.sendMessage(chatId,
             '❌ Произошла ошибка при обработке файла.\n' +
             `Ошибка: ${error.message}\n\n` +
+            'Оплата/чек не списаны. Если чек был удержан, он возвращён.\n' +
             'Попробуйте еще раз или обратитесь к администратору.'
         );
     } finally {
@@ -607,7 +613,7 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
         let attempts = 0;
         let newFile = null;
         
-        while (attempts < 20 && !newFile) { // 20 попыток по 1 секунде = 20 секунд
+        while (attempts < 60 && !newFile) { // до 60 секунд ожидания
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             const filesAfter = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
@@ -657,8 +663,23 @@ async function uploadToAcademiCx(filePath, fileName, tempDir) {
 
             throw new Error('Downloaded file not ready for rename after retries');
         } else {
-            console.log('No new file found after 20 seconds');
-            throw new Error('Could not find downloaded file - timeout after 20 seconds');
+            // Последний fallback: попробуем найти ссылку для скачивания на странице
+            console.log('No file detected by watcher. Scanning page for download links...');
+            const candidateLinks = await page.$$eval('a[href]', as => as.map(a => a.href).filter(h => h && (h.includes('download') || h.endsWith('.pdf') || h.includes('.pdf'))));
+            if (candidateLinks && candidateLinks.length) {
+                const url = candidateLinks[0];
+                const processedFilePath = path.join(tempDir, `processed_${Date.now()}_${fileName}`);
+                try {
+                    await downloadFile(url, processedFilePath);
+                    console.log('File downloaded via page link scan fallback!');
+                    return processedFilePath;
+                } catch (e) {
+                    console.log('Link scan fallback failed:', e.message);
+                }
+            }
+
+            console.log('No new file found after extended wait');
+            throw new Error('Could not find downloaded file - timeout after 60 seconds');
         }
 
     } finally {
