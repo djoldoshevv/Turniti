@@ -1,0 +1,29 @@
+{
+  "name": "telegram-academi-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "start:http": "node bot-http.js",
+    "dev": "node bot.js",
+    "test": "node test-token.js",
+    "inspect": "node inspect-academi.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.0",
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^12.4.1",
+    "dotenv": "^17.2.3",
+    "ejs": "^3.1.10",
+    "express": "^5.1.0",
+    "form-data": "^4.0.4",
+    "jsonwebtoken": "^9.0.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "puppeteer": "^24.26.1",
+    "stripe": "^19.1.0"
+  }
+}
