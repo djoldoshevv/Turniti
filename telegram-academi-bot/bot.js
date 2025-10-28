@@ -280,6 +280,19 @@ async function handleDocumentJob(job) {
             } catch (_) {}
         }
 
+        // Validate supported extensions before sending to academi.cx
+        const ext = (path.extname(sanitizedName) || '').toLowerCase();
+        const supportedExts = new Set(['.docx', '.pdf']);
+        if (!supportedExts.has(ext)) {
+            // mark as rejected but do not charge
+            try { checksDB.add(chatId, fileName, fileSize, 'rejected_unsupported'); } catch (_) {}
+            await bot.editMessageText('⛔️ Неподдерживаемый формат файла. Поддерживаются только .docx и .pdf. Чек не списан.', {
+                chat_id: chatId,
+                message_id: processingMsg.message_id
+            });
+            return;
+        }
+
         await bot.editMessageText('📤 Отправляю на обработку...', {
             chat_id: chatId,
             message_id: processingMsg.message_id
@@ -322,12 +335,14 @@ async function handleDocumentJob(job) {
         try { checksDB.add(chatId, fileName, fileSize, 'failed'); } catch (_) {}
         // Возврат средств/чека: если пользователь в режиме free_checks, добавим 1 чек обратно
         try { if (accessReason === 'free_checks') userDB.addFreeChecks(chatId, 1); } catch (_) {}
-        await bot.sendMessage(chatId,
-            '❌ Произошла ошибка при обработке файла.\n' +
-            `Ошибка: ${error.message}\n\n` +
-            'Оплата/чек не списаны. Если чек был удержан, он возвращён.\n' +
-            'Попробуйте еще раз или обратитесь к администратору.'
-        );
+        const msgBase = '❌ Произошла ошибка при обработке файла.\n';
+        const refundNote = 'Оплата/чек не списаны. Если чек был удержан, он возвращён.';
+        let advice = 'Попробуйте еще раз или обратитесь к администратору.';
+        const em = (error && error.message) ? String(error.message) : '';
+        if (em.includes('OfficeImportErrorDomain') || em.includes('912')) {
+            advice = 'Academi.cx отклонил файл при импорте Office (код 912). Пожалуйста, пересохраните документ как .DOCX или .PDF (Файл → Сохранить как), уберите встраиваемые объекты/защиту/пароль и попробуйте снова.';
+        }
+        await bot.sendMessage(chatId, `${msgBase}Ошибка: ${error.message}\n\n${refundNote}\n${advice}`);
     } finally {
         cleanup();
     }
