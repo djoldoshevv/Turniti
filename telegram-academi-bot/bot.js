@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const puppeteer = require('puppeteer');
 const { userDB, checksDB, transactionDB } = require('./database');
-const { startAdminPanel } = require('./admin-panel');
+const { startAdminPanel, app } = require('./admin-panel');
 
 // Replace with your Telegram Bot Token
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
@@ -21,8 +21,8 @@ const PAYMENT_PROVIDER_TOKEN = process.env.PAYMENT_PROVIDER_TOKEN || '';
 const PAYMENT_CURRENCY = process.env.PAYMENT_CURRENCY || 'USD'; // e.g., USD, EUR
 const USE_TELEGRAM_PAYMENTS = (process.env.USE_TELEGRAM_PAYMENTS || 'false').toLowerCase() === 'true';
 
-// Create bot instance
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// Create bot instance in webhook mode (no polling)
+const bot = new TelegramBot(TELEGRAM_TOKEN, {});
 
 // Temporary directory for file storage
 const TEMP_DIR = path.join(__dirname, 'temp');
@@ -92,6 +92,23 @@ function isValidDownloaded(filePath) {
 const userSessions = new Map();
 
 console.log('Bot started successfully!');
+
+// Setup Telegram Webhook endpoint using shared Express app
+try {
+    const WEBHOOK_PATH = `/webhook/${TELEGRAM_TOKEN}`;
+    const WEBHOOK_URL = `${PUBLIC_BASE_URL}${WEBHOOK_PATH}`;
+    // Endpoint to accept Telegram updates
+    app.post(WEBHOOK_PATH, (req, res) => {
+        try { bot.processUpdate(req.body); } catch (e) { console.error('processUpdate error:', e); }
+        res.sendStatus(200);
+    });
+    // Register webhook with Telegram
+    bot.setWebHook(WEBHOOK_URL).then(() => {
+        console.log('Webhook set:', WEBHOOK_URL);
+    }).catch((e) => console.error('setWebHook failed:', e.message));
+} catch (e) {
+    console.error('Webhook setup error:', e.message);
+}
 
 // Per-user processing queues to avoid cross-sending results
 const queueByUser = new Map(); // chatId -> [jobs]
